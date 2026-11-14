@@ -1,0 +1,21 @@
+# Recordings and generated media (large, private)
+*.frm/
+extracted/
+*.mp4
+*.mov
+*.m4a
+*.wav
+
+# Dependencies / builds
+node_modules/
+app/client/dist/
+tools/.venv/
+__pycache__/
+*.pyc
+
+# OS / editor / local tooling
+.DS_Store
+.tokensave/
+.claude/settings.local.json
+*.log
+.env
