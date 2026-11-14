@@ -1,5 +1,7 @@
 # Reframed workspace
 
+Read `ARCHITECTURE.md` first for how the CLI, server and web UI fit together. This file holds format notes, measurements and test status.
+
 Goal: quickly manipulate recordings made by the Reframed macOS app (e.g. blur the webcam background, recompose the final video).
 
 ## Layout
@@ -68,3 +70,9 @@ Node (Express) API + React (Vite) UI that drives `tools/reframed.py`. Written bu
 - Export button = `compose` job with `options.fromEditor`, which maps editor.json to `reframed.py compose --webcam/--audio/--cam-x/--cam-y/--cam-width/--mirror/--no-webcam` -> `extracted/<project>/composed.mp4`. Tested on the short project.
 - Not exported yet: corner radius (preview-only). No timeline/trim/cut editing yet; export uses the trim stored in project.json.
 - Screen and webcam tracks are HEVC 10-bit: they play in Edge/Safari/Chrome on macOS (hardware decode) but may not in Firefox.
+
+## Editor additions (cuts, waveform, camera crop, export options)
+- Timeline with waveform under the player: drag to select, "Cut selection" (or `x`/Delete) adds a cut; cuts are skipped in playback and removed in export. Tested: 2 cuts on the long project, export duration 244.9 s vs 245.2 s expected, frames around the join verified.
+- Camera shape rect/circle, zoom 1-4 and focus point (fx, fy) for both shapes; corner radius and circle are exported via an alpha mask.
+- Export dialog: resolution, frame rate (default 30), H.264/HEVC, quality, hardware/software encoder; progress bar and cancel (kills ffmpeg, removes partial file).
+- Screen track has duplicate timestamps / ~69 fps average although project.json says 60.

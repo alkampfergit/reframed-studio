@@ -104,10 +104,47 @@ app.put("/api/editor/:project", (req, res) => {
     audio: b.audio === "normalized" ? "normalized" : "original",
     x: num(b.x, 0, 1, 0.7), y: num(b.y, 0, 1, 0.04), w: num(b.w, 0.05, 1, 0.25),
     radius: num(b.radius, 0, 50, 4), mirror: !!b.mirror,
+    shape: b.shape === "circle" ? "circle" : "rect",
+    zoom: num(b.zoom, 1, 4, 1), fx: num(b.fx, 0, 1, 0.5), fy: num(b.fy, 0, 1, 0.5),
+    cuts: (Array.isArray(b.cuts) ? b.cuts : []).slice(0, 500)
+      .map((c) => ({ start: num(c?.start, 0, 1e6, NaN), end: num(c?.end, 0, 1e6, NaN) }))
+      .filter((c) => c.end > c.start)
+      .sort((a, b2) => a.start - b2.start),
   };
   fs.mkdirSync(path.dirname(editorFile(project)), { recursive: true });
   fs.writeFileSync(editorFile(project), JSON.stringify(cfg, null, 2));
   res.json(cfg);
+});
+
+// ---- waveform peaks for the timeline (cached in extracted/<project>/.preview/waveform.json) ----
+app.get("/api/waveform/:project", (req, res) => {
+  const project = req.params.project;
+  if (!known(project)) return res.status(404).end();
+  const src = path.join(EXTRACTED, project, "mic-audio.m4a");
+  if (!fs.existsSync(src)) return res.status(404).json({ error: "run extract first" });
+  const cache = path.join(EXTRACTED, project, ".preview", "waveform.json");
+  if (fs.existsSync(cache) && fs.statSync(cache).mtimeMs >= fs.statSync(src).mtimeMs) return res.sendFile(cache);
+  const RATE = 8000, BUCKETS = 8000;
+  const chunks = [];
+  const ff = spawn("ffmpeg", ["-v", "quiet", "-i", src, "-ac", "1", "-ar", String(RATE), "-f", "s16le", "-"]);
+  ff.stdout.on("data", (c) => chunks.push(c));
+  ff.on("error", () => res.status(500).json({ error: "ffmpeg not found" }));
+  ff.on("close", () => {
+    const buf = Buffer.concat(chunks);
+    const n = buf.length >> 1;
+    if (!n) return res.status(500).json({ error: "could not decode audio" });
+    const size = Math.max(1, Math.ceil(n / BUCKETS));
+    const peaks = [];
+    for (let i = 0; i < n; i += size) {
+      let m = 0;
+      for (let j = i, end = Math.min(n, i + size); j < end; j++) m = Math.max(m, Math.abs(buf.readInt16LE(j * 2)));
+      peaks.push(+(m / 32768).toFixed(4));
+    }
+    const out = { duration: n / RATE, peaks };
+    fs.mkdirSync(path.dirname(cache), { recursive: true });
+    fs.writeFileSync(cache, JSON.stringify(out));
+    res.json(out);
+  });
 });
 
 // ---- jobs ----
@@ -150,13 +187,25 @@ function buildArgs({ command, project, options = {} }) {
     case "compose": {
       const blur = path.join(out, "webcam_blurred.mp4");
       const args = ["compose", frm, "-o", path.join(out, "composed.mp4")];
+      const ex = options.export || {};
+      const height = [0, 720, 1080, 1440, 2160].includes(+ex.height) ? +ex.height : 0;
+      const fps = [0, 24, 30, 60].includes(+ex.fps) ? +ex.fps : 0;
+      args.push(
+        "--height", String(height), "--fps", String(fps),
+        "--codec", ex.codec === "hevc" ? "hevc" : "h264",
+        "--quality", ["high", "medium", "low"].includes(ex.quality) ? ex.quality : "high",
+        "--encoder", ex.encoder === "x264" ? "x264" : "videotoolbox",
+      );
       const ed = options.fromEditor && readEditor(project);
       if (options.fromEditor && !ed) throw new Error("no editor settings saved for this project");
       if (ed) {
         // export exactly what the editor shows
         options = { useBlurred: ed.camera === "webcam_blurred.mp4", useNormalized: ed.audio === "normalized" };
         if (ed.camera === "none") args.push("--no-webcam");
-        else args.push("--cam-x", String(ed.x), "--cam-y", String(ed.y), "--cam-width", String(ed.w), ...(ed.mirror ? ["--mirror"] : []));
+        else args.push("--cam-x", String(ed.x), "--cam-y", String(ed.y), "--cam-width", String(ed.w), ...(ed.mirror ? ["--mirror"] : []),
+          "--cam-shape", ed.shape === "circle" ? "circle" : "rect", "--cam-radius", String(num(ed.radius, 0, 50, 0) / 100),
+          "--cam-zoom", String(num(ed.zoom, 1, 4, 1)), "--cam-fx", String(num(ed.fx, 0, 1, 0.5)), "--cam-fy", String(num(ed.fy, 0, 1, 0.5)));
+        if (ed.cuts?.length) args.push("--cuts", ed.cuts.map((c) => `${c.start.toFixed(3)}-${c.end.toFixed(3)}`).join(","));
       }
       if (options.useBlurred) {
         if (!fs.existsSync(blur)) throw new Error("webcam_blurred.mp4 missing, run blur-bg first");
@@ -183,15 +232,36 @@ app.post("/api/jobs", (req, res) => {
     return res.status(400).json({ error: e.message });
   }
   const id = ++seq;
-  const job = { id, command: req.body.command, project: req.body.project, status: "running", log: "", startedAt: Date.now() };
+  const job = { id, command: req.body.command, project: req.body.project, status: "running", progress: 0, log: "", startedAt: Date.now() };
   jobs.set(id, job);
-  const child = spawn(PYTHON, ["-I", CLI, ...args], { cwd: WORKSPACE });
-  const add = (b) => (job.log += b.toString().replace(/\r/g, "\n"));
+  const child = spawn(PYTHON, ["-I", CLI, ...args], { cwd: WORKSPACE, detached: true });
+  // Split output into lines; "PROGRESS <pct>" lines update job.progress instead of the log
+  let buf = "";
+  const line = (l) => {
+    const m = /^PROGRESS ([\d.]+)$/.exec(l);
+    if (m) job.progress = Math.min(100, +m[1]);
+    else job.log += l + "\n";
+  };
+  const add = (b) => {
+    const lines = (buf + b.toString().replace(/\r/g, "\n")).split("\n");
+    buf = lines.pop();
+    lines.forEach(line);
+  };
   child.stdout.on("data", add);
   child.stderr.on("data", add);
   child.on("error", (e) => { job.log += `spawn error: ${e.message}\n`; job.status = "failed"; });
-  child.on("close", (code) => { if (job.status === "running") job.status = code === 0 ? "done" : "failed"; job.endedAt = Date.now(); });
-  job.cancel = () => child.kill("SIGTERM");
+  child.on("close", (code) => {
+    if (buf) line(buf);
+    if (job.status === "running") job.status = code === 0 ? "done" : "failed";
+    if (job.status === "done") job.progress = 100;
+    job.endedAt = Date.now();
+  });
+  job.cancel = () => {
+    if (job.status !== "running") return;
+    job.status = "cancelled";
+    try { process.kill(-child.pid, "SIGTERM"); } catch { child.kill("SIGTERM"); } // whole group: python + ffmpeg
+    if (job.command === "compose") child.once("close", () => fs.rmSync(path.join(EXTRACTED, job.project, "composed.mp4"), { force: true }));
+  };
   res.json({ id });
 });
 
@@ -205,7 +275,6 @@ app.delete("/api/jobs/:id", (req, res) => {
   const j = jobs.get(+req.params.id);
   if (!j) return res.status(404).end();
   j.cancel?.();
-  j.status = "cancelled";
   res.json({ ok: true });
 });
 

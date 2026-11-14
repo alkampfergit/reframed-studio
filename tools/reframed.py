@@ -66,7 +66,9 @@ def cmd_blur_bg(a):
     if src.is_dir():
         src = src / "webcam.mp4"
     dst = Path(a.output) if a.output else src.with_name(src.stem + "_blurred" + src.suffix)
-    w, h, fps, _ = probe(src)
+    w, h, fps, dur = probe(src)
+    fn, fd = fps.split("/")
+    total = max(1, dur * float(fn) / float(fd))
     if a.encoder == "videotoolbox":  # Apple Silicon hardware encoder
         enc = ["-c:v", "h264_videotoolbox", "-b:v", a.bitrate, "-allow_sw", "1"]
     else:
@@ -127,6 +129,7 @@ def cmd_blur_bg(a):
         n += 1
         if n % 150 == 0:
             print(f"{n} frames ({n / (time.time() - t0):.1f} fps)", file=sys.stderr, flush=True)
+            print(f"PROGRESS {min(100.0, n / total * 100):.1f}", file=sys.stderr, flush=True)
     wq.put(None)
     tw.join()
     ff.stdin.close()
@@ -168,7 +171,64 @@ def cmd_normalize_audio(a):
     print(f"wrote {dst}", file=sys.stderr)
 
 
+def run_progress(cmd, total_seconds):
+    """Run ffmpeg with -progress and print 'PROGRESS <percent>' lines (parsed by the web app)."""
+    print("+", " ".join(map(str, cmd)), file=sys.stderr, flush=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    last = -1.0
+    for line in proc.stdout:
+        if line.startswith("out_time_us="):
+            try:
+                pct = min(100.0, int(line.split("=")[1]) / 1e4 / max(total_seconds, 1e-6))
+            except ValueError:
+                continue
+            if pct - last >= 0.5:
+                last = pct
+                print(f"PROGRESS {pct:.1f}", file=sys.stderr, flush=True)
+    if proc.wait():
+        sys.exit(proc.returncode)
+    print("PROGRESS 100", file=sys.stderr, flush=True)
+
+
+def make_mask(w, h, r):
+    """Write a grayscale PNG: white rounded rectangle (corner radius r px; r = w/2 on a square = circle)."""
+    import tempfile
+    path = Path(tempfile.mkstemp(suffix=".png", prefix="reframed-mask-")[1])
+    expr = (f"255*clip({r}-hypot(max(abs(X+0.5-{w / 2})-({w / 2}-{r}),0),"
+            f"max(abs(Y+0.5-{h / 2})-({h / 2}-{r}),0))+0.5,0,1)")
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=black:s={w}x{h},format=gray,geq=lum='{expr}'",
+                    "-frames:v", "1", str(path)], check=True)
+    return path
+
+
+def encoder_args(a, width, height):
+    hevc = a.codec == "hevc"
+    if a.encoder == "x264":  # software
+        return ["-c:v", "libx265" if hevc else "libx264", "-preset", "veryfast",
+                "-crf", {"high": "18", "medium": "22", "low": "26"}[a.quality]] + (["-tag:v", "hvc1"] if hevc else [])
+    # Apple VideoToolbox hardware encoder; bitrate scaled from a 1080p reference
+    mbps = {"high": 12, "medium": 7, "low": 4}[a.quality] * (width * height) / (1920 * 1080) * (0.65 if hevc else 1)
+    return ["-c:v", "hevc_videotoolbox" if hevc else "h264_videotoolbox", "-b:v", f"{max(mbps, 1):.1f}M",
+            "-allow_sw", "1"] + (["-tag:v", "hvc1"] if hevc else [])
+
+
+def keep_segments(ts, te, cuts):
+    """Complement of the cut ranges inside [ts, te], as (start, end) relative to ts."""
+    segs, cur = [], ts
+    for cs, ce in sorted(cuts):
+        cs, ce = max(cs, ts), min(ce, te)
+        if ce <= cs:
+            continue
+        if cs - cur > 0.02:
+            segs.append((cur - ts, cs - ts))
+        cur = max(cur, ce)
+    if te - cur > 0.02:
+        segs.append((cur - ts, te - ts))
+    return segs
+
+
 def cmd_compose(a):
+    import time
     frm = Path(a.frm)
     p = load_project(frm)
     e = p["editorState"]
@@ -179,22 +239,83 @@ def cmd_compose(a):
     rw = lay["relativeWidth"] if a.cam_width is None else a.cam_width
     ts, te = e["trimStartSeconds"], e["trimEndSeconds"]
     t = ["-ss", str(ts), "-to", str(te)]
+    hw = ["-hwaccel", "videotoolbox"] if a.encoder == "videotoolbox" else []  # hardware decode
     out = Path(a.output) if a.output else frm.parent / f"{frm.stem}-composed.mp4"
     audio = a.audio or frm / "mic-audio.m4a"
-    cmd = ["ffmpeg", "-y", *t, "-i", str(frm / "screen.mp4")]
+    oh = (a.height or sh) // 2 * 2
+    ow = int(sw * oh / sh) // 2 * 2
+    post = ",".join(([f"scale={ow}:{oh}"] if a.height else []) + ["format=yuv420p"])
+    # Drop to the output frame rate first: the hardware encoder (~250 frames/s at 1080p on an M5) is the
+    # bottleneck and the screen track is ~69 fps, so every later stage then handles fewer frames.
+    pre = f"fps={a.fps}" if a.fps else "null"
+    mask = None
+    inputs = [*hw, *t, "-i", str(frm / "screen.mp4")]
+
+    # 1) picture-in-picture -> [vfull]
     if a.no_webcam:
-        cmd += [*t, "-i", str(audio), "-map", "0:v", "-map", "1:a"]
+        inputs += [*t, "-i", str(audio)]
+        ai = 1
+        graph = f"[0:v]{pre}[vfull]"
     else:
         cam = frm / (a.webcam or "webcam.mp4")
         if not cam.exists():  # allow a processed webcam next to the package
             cam = Path(a.webcam)
         cw = int(sw * rw) // 2 * 2
         x, y = int(sw * rx), int(sh * ry)
-        flip = ",hflip" if a.mirror else ""
-        cmd += [*t, "-i", str(cam), *t, "-i", str(audio), "-filter_complex",
-                f"[1:v]scale={cw}:-2{flip}[cam];[0:v][cam]overlay={x}:{y}[v]", "-map", "[v]", "-map", "2:a"]
-    run(cmd + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-               "-c:a", "aac", "-b:a", "192k", "-shortest", str(out)])
+        circle = a.cam_shape == "circle"
+        ws, hs = p["webcamSize"]["width"], p["webcamSize"]["height"]
+        chh = cw if circle else int(cw * hs / ws) // 2 * 2
+        radius = cw / 2 if circle else min(max(a.cam_radius, 0) * cw, cw / 2, chh / 2)
+        chain = ""
+        zoom = max(a.cam_zoom, 1)
+        if circle or zoom > 1:  # crop: zoom + focus point choose which part of the camera frame is shown
+            kw = int((min(ws, hs) if circle else ws) / zoom) // 2 * 2
+            kh = int((min(ws, hs) if circle else hs) / zoom) // 2 * 2
+            cx = int(min(max(a.cam_fx * ws - kw / 2, 0), ws - kw))
+            cy = int(min(max(a.cam_fy * hs - kh / 2, 0), hs - kh))
+            chain = f"crop={kw}:{kh}:{cx}:{cy},"
+        chain += f"scale={cw}:{chh}" + (",hflip" if a.mirror else "")
+        inputs += [*hw, *t, "-i", str(cam), *t, "-i", str(audio)]
+        ai = 2
+        if radius >= 1:  # rounded corners / circle: alpha mask rendered once, then merged per frame
+            mask = make_mask(cw, chh, radius)
+            inputs += ["-loop", "1", "-i", str(mask)]
+            graph = (f"[1:v]{chain},format=yuva420p[c];[3:v]format=gray[m];[c][m]alphamerge[cam];"
+                     f"[0:v]{pre}[scr];[scr][cam]overlay={x}:{y}[vfull]")
+        else:
+            graph = f"[1:v]{chain}[cam];[0:v]{pre}[scr];[scr][cam]overlay={x}:{y}[vfull]"
+
+    # 2) cuts: keep the segments between the cut ranges and join them
+    cuts = [tuple(float(v) for v in c.split("-")) for c in a.cuts.split(",") if c] if a.cuts else []
+    segs = keep_segments(ts, te, cuts)
+    if not segs:
+        sys.exit("nothing left to export: the cuts cover the whole recording")
+    total = sum(e2 - s2 for s2, e2 in segs)
+    if cuts:
+        n = len(segs)
+        graph += (f";[vfull]split={n}" + "".join(f"[vs{i}]" for i in range(n)) +
+                  f";[{ai}:a]asplit={n}" + "".join(f"[as{i}]" for i in range(n)))
+        for i, (s2, e2) in enumerate(segs):
+            graph += (f";[vs{i}]trim={s2:.3f}:{e2:.3f},setpts=PTS-STARTPTS[v{i}]"
+                      f";[as{i}]atrim={s2:.3f}:{e2:.3f},asetpts=PTS-STARTPTS[a{i}]")
+        graph += ";" + "".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]"
+        vlabel, amap = "[vc]", "[ac]"
+    else:
+        vlabel, amap = "[vfull]", f"{ai}:a"
+    graph += f";{vlabel}{post}[v]"
+
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "warning", "-nostats", "-progress", "pipe:1", *inputs,
+           "-filter_complex", graph, "-map", "[v]", "-map", amap, *encoder_args(a, ow, oh),
+           "-c:a", "aac", "-b:a", "192k", "-t", f"{total:.3f}", "-shortest", str(out)]
+    t0 = time.time()
+    try:
+        run_progress(cmd, total)
+    finally:
+        if mask:
+            mask.unlink(missing_ok=True)
+    dt = time.time() - t0
+    print(f"wrote {out}: {ow}x{oh}, {total:.1f}s of video ({len(segs)} segment(s)), {out.stat().st_size / 1e6:.1f} MB "
+          f"in {dt:.1f}s ({total / max(dt, 1e-6):.1f}x realtime)", file=sys.stderr)
 
 
 def main():
@@ -228,6 +349,18 @@ def main():
     s.add_argument("--cam-y", type=float, help="camera top edge, fraction of screen height")
     s.add_argument("--cam-width", type=float, help="camera width, fraction of screen width")
     s.add_argument("--mirror", action="store_true", help="flip the camera horizontally")
+    s.add_argument("--cam-shape", choices=["rect", "circle"], default="rect", help="circle = centre-cropped round camera")
+    s.add_argument("--cam-radius", type=float, default=0, help="corner radius as a fraction of camera width (rect only)")
+    s.add_argument("--cam-zoom", type=float, default=1, help="zoom into the camera frame (1 = widest)")
+    s.add_argument("--cam-fx", type=float, default=0.5, help="horizontal focus point 0-1 (used when zoomed or circle)")
+    s.add_argument("--cam-fy", type=float, default=0.5, help="vertical focus point 0-1 (used when zoomed or circle)")
+    s.add_argument("--cuts", default="", help="ranges to remove, in seconds: 'start-end,start-end'")
+    s.add_argument("--height", type=int, default=0, help="output height, e.g. 1080 or 720 (0 = same as the recording)")
+    s.add_argument("--fps", type=int, default=0, help="output frame rate (0 = same as the recording)")
+    s.add_argument("--codec", choices=["h264", "hevc"], default="h264")
+    s.add_argument("--quality", choices=["high", "medium", "low"], default="high")
+    s.add_argument("--encoder", choices=["videotoolbox", "x264"], default="videotoolbox",
+                   help="videotoolbox = Apple hardware decode + encode, x264 = software")
     s.set_defaults(f=cmd_compose)
     a = ap.parse_args()
     a.f(a)

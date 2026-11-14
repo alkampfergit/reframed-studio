@@ -75,7 +75,7 @@ export default function App() {
       {view === "editor" && (
         <div className="editorwrap">
           {project ? (
-            <Editor key={project.name} project={project} busy={busy} lastJob={jobs[0]} onExport={() => run("compose", { fromEditor: true })} />
+            <Editor key={project.name} project={project} busy={busy} lastJob={jobs[0]} onExport={(params) => run("compose", { fromEditor: true, export: params })} onCancel={(id) => fetch(`/api/jobs/${id}`, { method: "DELETE" })} />
           ) : (
             <p className="muted">Select a project.</p>
           )}
@@ -164,7 +164,7 @@ export default function App() {
           <div className="joblist">
             {jobs.map((j) => (
               <button key={j.id} className={"job " + j.status + (j.id === openJob ? " active" : "")} onClick={() => setOpenJob(j.id)}>
-                #{j.id} {j.command} <small>{j.status}</small>
+                #{j.id} {j.command} <small>{j.status}{j.status === "running" ? ` ${Math.round(j.progress || 0)}%` : ""}</small>
               </button>
             ))}
             {!jobs.length && <span className="muted">No jobs yet.</span>}
