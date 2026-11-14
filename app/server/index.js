@@ -6,9 +6,10 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const WORKSPACE = process.env.REFRAMED_DIR || path.resolve(here, "../..");
-const CLI = path.join(WORKSPACE, "tools/reframed.py");
+const REPO = path.resolve(here, "../..");
+const CLI = path.join(REPO, "tools/reframed.py"); // tools live in the repo, recordings in WORKSPACE
 const EXTRACTED = path.join(WORKSPACE, "extracted");
-const VENV_PY = path.join(WORKSPACE, "tools/.venv/bin/python");
+const VENV_PY = path.join(REPO, "tools/.venv/bin/python");
 const PYTHON = process.env.PYTHON || (fs.existsSync(VENV_PY) ? VENV_PY : "python3");
 const PORT = process.env.PORT || 3001;
 

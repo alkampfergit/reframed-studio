@@ -51,7 +51,7 @@ Plain Python 3.9, standard library only, except `blur-bg` (imports cv2/mediapipe
 
 ## Server (`app/server/index.js`)
 
-Single file, no database. Binds to 127.0.0.1. Env: `REFRAMED_DIR`, `PYTHON` (defaults to `tools/.venv/bin/python` when present), `PORT`.
+Single file, no database. Binds to 127.0.0.1. Env: `REFRAMED_DIR` (folder holding the `*.frm` projects and `extracted/`; defaults to the repo root, tools are always loaded from the repo), `PYTHON` (defaults to `tools/.venv/bin/python` when present), `PORT`.
 
 | Route | Purpose |
 |---|---|
